@@ -1,0 +1,16 @@
+# General
+*.a
+*.dSYM/
+*.la
+*.lo
+*.o
+*.opensdf
+*.orig
+*.sdf
+*.suo
+*.swp
+*.tests
+*.vcxproj.filters
+*.vcxproj.user
+*~
+.git
