@@ -1,6 +1,43 @@
 {
+    "workbench.colorTheme": "Ayu Dark Bordered",
+    "git.ignoreLimitWarning": true,
+    "workbench.colorCustomizations": {
+        "terminal.foreground" : "#FFF",
+        "terminal.border": "#fff",
+        "terminal.ansiBlack": "#797979",
+        "terminal.ansiBrightWhite": "#ff0000",
+        "terminal.ansiWhite": "#f7f7f7",
+        "terminal.ansiYellow": "#ffcd2a"
+    },
     "files.associations": {
-        "typeinfo": "c",
-        "utils.h": "c"
-    }
+        "module.h": "c",
+        "stdlib.h": "c",
+        "algorithm": "c",
+        "iterator": "c",
+        "__locale": "c",
+        "ios": "c",
+        "getopt.h": "c",
+        "__bit_reference": "c",
+        "__functional_base": "c",
+        "__node_handle": "c",
+        "atomic": "c",
+        "bitset": "c",
+        "chrono": "c",
+        "cstddef": "c",
+        "deque": "c",
+        "__memory": "c",
+        "functional": "c",
+        "limits": "c",
+        "locale": "c",
+        "optional": "c",
+        "random": "c",
+        "ratio": "c",
+        "system_error": "c",
+        "tuple": "c",
+        "type_traits": "c",
+        "vector": "c",
+        "*.tcc": "c",
+        "array": "c",
+        "utility": "c"
+    },
 }
