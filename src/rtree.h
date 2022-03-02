@@ -23,17 +23,22 @@
 
 
 
-typedef struct rtree RTree;
+typedef struct RTree RTree_t;
 
-uint8_t RTreeInsert(struct rtree *rtree, uint64_t *rect, void *item);
-struct rtree *RTreeInit(size_t elsize, int dims);
-void RTreeDestroy(struct rtree *rtree);
-size_t RTreeCount(struct rtree *rtree);
-uint8_t RTreeDelete(struct rtree *rtree, uint64_t *rect, void *item);
-uint8_t RTreeSearch(struct rtree *rtree, uint64_t *rect, 
-                  uint8_t (*iter)(const uint64_t *rect, const void *item, 
-                               void *udata), 
-                  void *udata);
+uint8_t RTreeInsert(RTree_t *rtree, uint64_t *rect, void *item);
+RTree_t *RTreeInit(size_t elsize, int dims);
+void RTreeDestroy(RTree_t *rtree);
+size_t RTreeCount(RTree_t *rtree);
+uint8_t RTreeDelete(RTree_t *rtree, uint64_t *rect, void *item);
+uint8_t RTreeSearch(
+    RTree_t *rtree, 
+    uint64_t *rect, 
+    uint8_t (*iter)(
+        const uint64_t *rect, 
+        const void *item, 
+        void *udata
+    ), 
+    void *udata);
 
 void RTreeSetAllocator(void *(malloc)(size_t), void (*free)(void*));
 

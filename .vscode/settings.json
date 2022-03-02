@@ -1,8 +1,8 @@
 {
-    "workbench.colorTheme": "Ayu Dark Bordered",
+    "workbench.colorTheme": "Visual Studio Light - C++",
     "git.ignoreLimitWarning": true,
     "workbench.colorCustomizations": {
-        "terminal.foreground" : "#FFF",
+        "terminal.foreground" : "#000",
         "terminal.border": "#fff",
         "terminal.ansiBlack": "#797979",
         "terminal.ansiBrightWhite": "#ff0000",
@@ -38,6 +38,8 @@
         "vector": "c",
         "*.tcc": "c",
         "array": "c",
-        "utility": "c"
+        "utility": "c",
+        "param.h": "c",
+        "hashtable.h": "c"
     },
 }

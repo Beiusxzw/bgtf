@@ -1,4 +1,7 @@
+#include <string.h>
 #include "utils.h"
+
+
 
 uint8_t is_binary(const void *buf, const size_t buf_len)
 {
@@ -56,3 +59,31 @@ uint8_t is_binary(const void *buf, const size_t buf_len)
     return 0;
 }
 
+char *bgtf_str_cpy(char *src)
+{
+    char *dest = malloc(strlen(src)+1);
+    memset(dest, 0, strlen(src)+1);
+    memcpy(dest, src, strlen(src));
+    return dest;
+}
+
+char *bgtf_str_concat(char *s1, char *s2)
+{
+    char *dest = malloc(strlen(s1) + strlen(s2) + 1);
+    memset(dest, 0, strlen(s1) + strlen(s2) + 1);
+    memcpy(dest, s1, strlen(s1));
+    memcpy(dest + strlen(s1), s2, strlen(s2));
+    return dest;
+}
+
+uint8_t bgtf_str_startswith(char *s, char *prefix)
+{
+    int prefix_l = strlen(prefix);
+    return (strncmp(s, prefix, prefix_l) == 0);
+}
+
+uint8_t bgtf_str_endswith(char *s, char *suffix)
+{
+    int suffix_l = strlen(suffix);
+    return (strncmp(s + strlen(s) - suffix_l, suffix, suffix_l) == 0)
+}

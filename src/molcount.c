@@ -1,86 +1,11 @@
 #include <getopt.h>
 #include <htslib/bgzf.h>
+
 #include "tpool.h"
 #include "molcount.h"
 #include "sparse.h"
+#include "bgtf-bam.h"
 
-static void bamToLoc( bam_hdr_t *bamHdr, bam1_t *aln, GenomicLocation *loc)
-{
-    loc->start = aln->core.pos + 1; // left most position of alignment in zero based coordianate (+1)
-	loc->chrom = bamHdr->target_name[aln->core.tid] ; //contig name (chromosome)
-    loc->end = loc->start + bam_cigar2rlen(aln->core.n_cigar, bam_get_cigar(aln)); //length of the read
-}
-
-void BamAlignmentDestroyHelper(void *e)
-{
-    destroyGenomicLocation(e, 0);
-}
-
-BamAlignment *BamAlignmentInit()
-{
-    BamAlignment *baln = malloc(sizeof(BamAlignment));
-    memset(baln, 0, sizeof(BamAlignment));
-    baln->loc = malloc(sizeof(GenomicLocation));
-    memset(baln->loc, 0, sizeof(GenomicLocation));
-    baln->spliced_loc = LinkedListInit();
-    LinkedListSetDealloc(baln->spliced_loc, BamAlignmentDestroyHelper);
-    return baln;
-}
-
-void BamAlignmentDestroy(BamAlignment *baln)
-{
-    LinkedListDestroy(GenomicLocation, baln->spliced_loc, 1);
-    if (baln->barcode) free(baln->barcode);
-    free(baln->loc);
-    free(baln);
-}
-
-BamAlignment *parseOneAlignment(BamFile_t *bamfile)
-{
-    if (!(sam_read1(bamfile->fp, bamfile->bam_hdr, bamfile->aln) > 0)) {
-        return NULL;
-    }
-    BamAlignment *baln = BamAlignmentInit();
-    baln->spliced_alignment = 0;
-    baln->strand = bamfile->aln->core.flag & BAM_FREVERSE ? 0 : 1;
-    bamToLoc(bamfile->bam_hdr, bamfile->aln, baln->loc);
-    uint32_t *cigar = bam_get_cigar(bamfile->aln);
-    uint32_t n_cigar = bamfile->aln->core.n_cigar;
-    uint64_t start = bamfile->aln->core.pos + 1;
-    uint64_t end = start;
-    for (uint32_t i = 0; i < n_cigar; ++i) {
-        const int op = bam_cigar_op(cigar[i]);
-        const int ol = bam_cigar_oplen(cigar[i]);
-        switch (op)
-        {
-        case BAM_CREF_SKIP:
-            /* the bam alignment is likely to be a splice read. */
-            baln->spliced_alignment++;
-            GenomicLocation *cur = GenomicLocationNew();
-            cur->chrom = bamfile->bam_hdr->target_name[bamfile->aln->core.tid];
-            cur->start = start;
-            cur->end = end - 1;
-            LinkedListAppend(GenomicLocation, baln->spliced_loc, cur);
-            start = end + ol;
-            end = start;
-            break;
-        default:
-            end = end + ol;
-            break;
-        }
-    }
-    if (baln->spliced_alignment > 0) {
-        GenomicLocation *cur = GenomicLocationNew();
-        cur->chrom = bamfile->bam_hdr->target_name[bamfile->aln->core.tid];
-        cur->start = start;
-        cur->end = end;
-        LinkedListAppend(GenomicLocation, baln->spliced_loc, cur)
-    }
-    return baln;
-}
-
-// TODO: change "gene_name" to user arguments and strandess. 
-// This requires passing argument to this callback function
 uint8_t assignFeature(const uint64_t *rect, void *item, void *udata)
 {
     BGTFRecord_t *record = (BGTFRecord_t *)item;
@@ -97,15 +22,6 @@ uint8_t assignFeature(const uint64_t *rect, void *item, void *udata)
     return 1;
 }
 
-static void counterAdd(HashTable *counter, char *key)
-{
-    if (!(HashTableContainsKey(counter, key)))
-    {
-        HashTablePut(counter, key, 1);
-    }
-    int c = HashTableGet(counter, key);
-    HashTablePut(counter, key, c + 1);
-}
 
 void AnnotateLocDestroyHelper(void *e)
 {
@@ -155,14 +71,6 @@ uint8_t annotateBam(BGTF *fp, BamAlignment *baln, char *attr_name)
         GenomicLocation *first = baln->spliced_loc->elem_head;
         GenomicLocation *last = baln->spliced_loc->elem_tail;
         LinkedListMergeSort(GenomicLocation, record_locs->locs, GenomicLocationCompare);
-        
-        /*
-        printf("HEAD ");printGenomicLocation(first); printf("\n");
-        printf("TAIL ");printGenomicLocation(last); printf("\n");
-        LinkedListForEach(GenomicLocation, record_locs->locs, loc, {
-                printGenomicLocation(loc);printf("\n");
-        });
-        */
 
         // The record locations are already sorted
         loc = NULL;
@@ -255,37 +163,137 @@ cleanup:
     return success_flag;
 }
 
-static ExpressionMatrix_t *ExpressionMatrixDenseInit(size_t n_row, size_t n_col)
+static uint8_t annotateBamRmsk(BGTF *gfp, BGTF* tfp, BamAlignment *baln, char *gene_attr_name, char *rmsk_attr_name)
+{
+    uint8_t ret = annotateBam(gfp, baln, gene_attr_name);
+    if ((ret == 0) && (baln->annotation)) return ret;
+    if ((!baln->spliced_alignment) && (!baln->spliced_annotation)) {
+        // We cannot find an Gene record to support this read
+        // Also, this read is not aligned to be spliced
+        RecordLocs *record_locs = RecordLocsInit(baln->strand, rmsk_attr_name);
+        GenomicLocation *record_loc, *loc;
+        if (BGTFGetRecord(tfp, baln->loc, assignFeature, record_locs) > 0 || (record_locs->locs->sz == 0))
+        {
+            RecordLocsDestroy(record_locs);
+            return 1;
+        };
+        uint8_t success_flag = 0;
+        HashTable *counter = HashTableCreate(0x4);
+        HashTableSetKeyComparisonFunction(counter, strncmp);
+        HashTableSetHashFunction(counter, HashTableStringHashFunction);
+        char *feature_name;
+        LinkedListForEach(GenomicLocation, record_locs->locs, loc, {
+            if (loc->start <= baln->loc->start && loc->end >= baln->loc->end) {
+                feature_name = ((AssignFeature_t *)loc->data)->feature_name;
+                counterAdd(counter, feature_name);  
+            }
+
+        });
+        char *key; int value; char *max_key; int max_value = 0;
+        if (HashTableIsEmpty(counter)) {
+            success_flag = 1;
+            RecordLocsDestroy(record_locs);
+            HashTableDestroy(counter);
+            return success_flag & ret;
+        }
+        HashTableForEach(counter, key, value, {
+            if (value > max_value) {
+                max_key = key; 
+                max_value = value; // max record supporting the assignment
+            }
+        })
+        baln->annotation = max_key;
+        baln->is_rmsk = 1;
+        RecordLocsDestroy(record_locs);
+        HashTableDestroy(counter);
+        return success_flag;
+    } else {
+        return 1;
+    }
+}
+
+uint8_t annotateBamPaired(BGTF *fp, PairedAlignment *paln, char *attr_name)
+{
+    // TODO: Rewrite this function
+    if (!paln->paired) {
+        // The read is not properly paired
+        return annotateBam(fp, paln->mate1, attr_name);
+    } else {
+        uint8_t success1 = 0, success2 = 0;
+        success1 = annotateBam(fp, paln->mate1, attr_name);
+        success2 = annotateBam(fp, paln->mate2, attr_name);
+
+        if (success1 == 0) {
+            paln->annotation = paln->mate1->annotation;
+        } else if (success2 == 0) {
+            paln->annotation = paln->mate2->annotation;
+        }
+        paln->spliced_annotation = paln->mate1->spliced_annotation & paln->mate2->spliced_annotation;
+        return !((!success1) | (!success2));
+    }
+}
+
+uint8_t annotateBamPairedRmsk(BGTF *gfp, BGTF* tfp, PairedAlignment *paln, char *gene_attr_name, char *rmsk_attr_name)
+{
+    // TODO: Rewrite this function
+    if (!paln->paired) {
+        // The read is not properly paired
+        return annotateBamRmsk(gfp, tfp, paln->mate1, gene_attr_name, rmsk_attr_name);
+    } else {
+        uint8_t ret = annotateBamPaired(gfp, paln, gene_attr_name);
+        if ((ret == 0) && (paln->annotation)) return ret;
+        if ((!paln->spliced_annotation) && (!paln->mate1->spliced_alignment) && (!paln->mate2->spliced_alignment))
+        {
+            annotateBamRmsk(gfp, tfp, paln->mate1, gene_attr_name, rmsk_attr_name);
+            annotateBamRmsk(gfp, tfp, paln->mate2, gene_attr_name, rmsk_attr_name);
+            if (strcmp(paln->mate1->annotation, paln->mate2->annotation) == 0) {
+                paln->annotation = paln->mate1->annotation;
+                paln->is_rmsk = 1;
+                return 0;
+            }
+        } else {
+            return 1;
+        }
+    }
+}
+
+static ExpressionMatrix_t *ExpressionMatrixDenseInit(size_t n_row, size_t n_col, uint8_t splice_only)
 {
     logf("Initialize dense matrix %d × %d", n_row, n_col);
     ExpressionMatrix_t *matrix = malloc(sizeof(ExpressionMatrix_t));
     memset(matrix, 0, sizeof(ExpressionMatrix_t));
     matrix->spliced = calloc(n_col * n_row, sizeof(uint16_t));
-    matrix->unspliced = calloc(n_col * n_row, sizeof(uint16_t));
+    memset(matrix->spliced, 0, n_col * n_row * sizeof(uint16_t));
+    if (!splice_only) {
+        matrix->unspliced = calloc(n_col * n_row, sizeof(uint16_t));
+        memset(matrix->unspliced, 0, n_col * n_row * sizeof(uint16_t));
+    }
     return matrix;
 }
 
-static ExpressionMatrix_t *ExpressionMatrixSparseInit(size_t n_row, size_t n_col)
+static ExpressionMatrix_t *ExpressionMatrixSparseInit(size_t n_row, size_t n_col, uint8_t splice_only)
 {
     logf("Initialize sparse matrix %d × %d", n_row, n_col);
     ExpressionMatrix_t *matrix = malloc(sizeof(ExpressionMatrix_t));
     memset(matrix, 0, sizeof(ExpressionMatrix_t));
     matrix->spliced = newMatrix(n_row, n_col);
-    matrix->unspliced = newMatrix(n_row, n_col);
+    if (!splice_only) matrix->unspliced = newMatrix(n_row, n_col);
     return matrix;
 }
 
-ExpressionMatrix_t *ExpressionMatrixInit(size_t n_row, size_t n_col, uint8_t sparse)
+ExpressionMatrix_t *ExpressionMatrixInit(size_t n_row, size_t n_col, uint8_t sparse, uint8_t splice_only)
 {
     ExpressionMatrix_t *matrix;
     if (sparse) {
-        matrix = ExpressionMatrixSparseInit(n_row, n_col);
+        matrix = ExpressionMatrixSparseInit(n_row, n_col, splice_only);
     } else {
-        matrix = ExpressionMatrixDenseInit(n_row, n_col);
+        matrix = ExpressionMatrixDenseInit(n_row, n_col, splice_only);
     }
     matrix->is_sparse = sparse;
     matrix->n_row = n_row;
     matrix->n_col = n_col;
+    matrix->splice_only = splice_only;    
+    matrix->n_non_zero = 0;
     return matrix;
 }
 
@@ -322,50 +330,41 @@ uint16_t ExpressionMatrixInitGet(ExpressionMatrix_t *matrix, char *row_name, cha
     }
 }
 
-void ExpressionMatrixSet(ExpressionMatrix_t *matrix, char *row_name, char *col_name, uint8_t spliced, uint8_t trylock, uint16_t value)
+void ExpressionMatrixSet(ExpressionMatrix_t *matrix, char *row_name, char *col_name, uint8_t spliced, uint8_t lock, uint16_t value)
 {
+    matrix->_non_zero_cache = 0;
     int64_t col = HashTableGet(matrix->col_index, col_name) - 1;
     int64_t row = HashTableGet(matrix->row_index, row_name) - 1; 
     if (col < 0 || row < 0) return;
     if (matrix->is_sparse) {
+        // TODO: Sparse implementation
         Matrix exp;
         if (spliced) {
             exp = (Matrix) matrix->spliced;
         } else {
             exp = (Matrix) matrix->unspliced;
         }
-        if (matrix->n_threads && trylock) {
-            while (pthread_mutex_trylock(&matrix->mu) != 0);
+        if (matrix->n_threads && lock) {
+            while (pthread_mutex_lock(&matrix->mu) != 0);
         }
         addEntryToIMatrix(exp, row, col, value);
-        if (matrix->n_threads && trylock) {
+        if (matrix->n_threads && lock) {
             pthread_mutex_unlock(&matrix->mu);
         }
     } else {
         uint16_t *spliced_exp, *unspliced_exp;;
         spliced_exp = (uint16_t *) matrix->spliced;
-        unspliced_exp = (uint16_t *) matrix->unspliced;
-        if (matrix->n_threads && trylock) {
-            while (pthread_mutex_trylock(&matrix->mu) != 0);
+        if (matrix->n_threads && lock) {
+            while (pthread_mutex_lock(&matrix->mu) != 0);
         }
-        if ((spliced_exp[row * matrix->n_col + col] == 0) && 
-            (unspliced_exp[row * matrix->n_col + col] == 0) && 
-            (value != 0)) {
-            matrix->n_non_zero++;
+        if (!matrix->splice_only)
+        {
+            unspliced_exp = (uint16_t *) matrix->unspliced;
+            if (spliced) spliced_exp[row * matrix->n_col + col] = value;
+            else unspliced_exp[row * matrix->n_col + col] = value;
+        } else {
+            spliced_exp[row * matrix->n_col + col] = value;
         }
-        if ((spliced_exp[row * matrix->n_col + col] != 0) && 
-            (unspliced_exp[row * matrix->n_col + col] == 0) && 
-            (value != 0) && spliced) {
-            matrix->n_non_zero--;
-            }
-        if ((spliced_exp[row * matrix->n_col + col] == 0) && 
-            (unspliced_exp[row * matrix->n_col + col] != 0) && 
-            (value != 0) && !spliced) {
-            matrix->n_non_zero--;
-            }
-
-        if (spliced) spliced_exp[row * matrix->n_col + col] = value;
-        else unspliced_exp[row * matrix->n_col + col] = value;
         if (matrix->n_threads) {
             pthread_mutex_unlock(&matrix->mu);
         }
@@ -374,8 +373,9 @@ void ExpressionMatrixSet(ExpressionMatrix_t *matrix, char *row_name, char *col_n
 
 
 
-void ExpressionMatrixInc(ExpressionMatrix_t *matrix, char *row_name, char *col_name, uint8_t spliced, uint8_t trylock)
+void ExpressionMatrixInc(ExpressionMatrix_t *matrix, char *row_name, char *col_name, uint8_t spliced, uint8_t lock)
 {
+    matrix->_non_zero_cache = 0;
     if (row_name == NULL) {
         warnf("The row_name is %s for this read", row_name);
         return;
@@ -388,36 +388,40 @@ void ExpressionMatrixInc(ExpressionMatrix_t *matrix, char *row_name, char *col_n
     int64_t row = HashTableGet(matrix->row_index, row_name) - 1;
     if (col < 0 || row < 0) return;
     if (matrix->is_sparse) {
+        // TODO: Sparse implementation
         Matrix exp;
         if (spliced) {
             exp = (Matrix) matrix->spliced;
         } else {
             exp = (Matrix) matrix->unspliced;
         }
-        if (matrix->n_threads && trylock) {
-            while (pthread_mutex_trylock(&matrix->mu) != 0);
+        if (matrix->n_threads && lock) {
+            while (pthread_mutex_lock(&matrix->mu) != 0);
         }
         accumulateEntryInIMatrix(exp, row, col, 1);
-        if (matrix->n_threads && trylock) {
+        if (matrix->n_threads && lock) {
             pthread_mutex_unlock(&matrix->mu);
         }
     } else {
         uint16_t *spliced_exp, *unspliced_exp;;
         spliced_exp = (uint16_t *) matrix->spliced;
-        unspliced_exp = (uint16_t *) matrix->unspliced;
-        if (matrix->n_threads && trylock) {
-            while (pthread_mutex_trylock(&matrix->mu) != 0);
+        
+        if (matrix->n_threads && lock) {
+            while (pthread_mutex_lock(&matrix->mu) != 0);
         }
-        if ((spliced_exp[row * matrix->n_col + col] == 0) && 
-            (unspliced_exp[row * matrix->n_col + col] == 0)) {
-            matrix->n_non_zero++;
-        }
-        if (spliced) {
-            spliced_exp[row * matrix->n_col + col]++;
+        
+        if (!matrix->splice_only) {
+            unspliced_exp = (uint16_t *) matrix->unspliced;
+            if (spliced) {
+                spliced_exp[row * matrix->n_col + col]++;
+            } else {
+                unspliced_exp[row * matrix->n_col + col]++;
+            }
+            
         } else {
-            unspliced_exp[row * matrix->n_col + col]++;
+            spliced_exp[row * matrix->n_col + col]++;
         }
-        if (matrix->n_threads && trylock) {
+        if (matrix->n_threads && lock) {
             pthread_mutex_unlock(&matrix->mu);
         }
     }
@@ -428,14 +432,41 @@ void ExpressionMatrixDestroy(ExpressionMatrix_t *matrix)
     if (matrix->is_sparse) {
 
     } else {
-        free(matrix->spliced);
-        free(matrix->unspliced);
+        if (matrix->spliced) free(matrix->spliced);
+        if (matrix->unspliced) free(matrix->unspliced);
         free(matrix);
     }
+}
+ 
+static size_t ExpressionMatrixnNonZero(ExpressionMatrix_t *matrix)
+{
+    if (matrix->_non_zero_cache) return matrix->n_non_zero;
+    size_t nonzeros = 0;
+    size_t i,j;
+    uint16_t v,u=0;
+    if (matrix->is_sparse) {
+    } else {
+        uint16_t *spliced_exp, *unspliced_exp;
+        spliced_exp = (uint16_t *) matrix->spliced;
+        if (!matrix->splice_only) unspliced_exp = (uint16_t *) matrix->unspliced;
+        for (i = 0; i < matrix->n_row; ++i) {
+            for (j = 0; j < matrix->n_col; ++j) {
+                v = spliced_exp[i * matrix->n_col + j];
+                if (!matrix->splice_only) u = unspliced_exp[i * matrix->n_col + j];
+                if (v > 0 || u > 0) {
+                    nonzeros++;
+                }
+            }
+        }
+    }
+    matrix->n_non_zero = nonzeros;
+    matrix->_non_zero_cache = 1;
+    return nonzeros;
 }
 
 uint8_t ExpressionMatrixToFile(ExpressionMatrix_t *matrix, FILE *spliced_stream, FILE *unspliced_stream)
 {
+    ExpressionMatrixnNonZero(matrix);
     fprintf(spliced_stream, "%s", "\%\%MatrixMarket matrix coordinate integer general\n");
     fprintf(spliced_stream, "%s", "\%\n");
     fprintf(spliced_stream, "%llu %llu %llu\n", matrix->n_col, matrix->n_row, matrix->n_non_zero);
@@ -463,6 +494,28 @@ uint8_t ExpressionMatrixToFile(ExpressionMatrix_t *matrix, FILE *spliced_stream,
     return 0;
 }
 
+uint8_t ExpressionMatrixToFile_(ExpressionMatrix_t *matrix, FILE *spliced_stream)
+{
+    ExpressionMatrixnNonZero(matrix);
+    fprintf(spliced_stream, "%s", "\%\%MatrixMarket matrix coordinate integer general\n");
+    fprintf(spliced_stream, "%s", "\%\n");
+    fprintf(spliced_stream, "%llu %llu %llu\n", matrix->n_col, matrix->n_row, matrix->n_non_zero);
+    uint16_t *spliced_exp = (uint16_t *)matrix->spliced;
+    size_t i,j;
+    uint16_t v;
+    for (i = 0; i < matrix->n_row; ++i)
+    {
+        for (j = 0; j < matrix->n_col; ++j)
+        {
+            v = spliced_exp[i * matrix->n_col + j];
+            if (v > 0)
+            {
+                fprintf(spliced_stream, "%llu %llu %d\n", j + 1, i + 1, v);
+            }
+        }
+    }
+}
+
 void ExpressionMatrixSetMt(ExpressionMatrix_t *matrix)
 {
     pthread_mutexattr_t attr;
@@ -478,25 +531,39 @@ void ExpressionMatrixUnsetMt(ExpressionMatrix_t *matrix)
 }
 
 typedef struct {
-    BamAlignment **baln;
-    size_t n_bam_alignments;
-    BGTF *fp;
-    ExpressionMatrix_t *mtx;
-    char *attr_name;
+    void **aln;                  /* Either BamAlignment or PairedAlignment */
+    size_t n_bam_alignments;      /* Number of BamAlignments or PairedAlignments */
+    BGTF *fp;                     /* GTF file */
+    BGTF *rmsk;                   /* repeat masker GTF file */
+    ExpressionMatrix_t *mtx;      /* Output matrix */
+    ExpressionMatrix_t *rmsk_mtx; /* Repeat masker output matrix */
+    char *attr_name;              /* Attribute name to be count */
+    char *rmsk_attr_name;         /* Repeat masker attribute name to be count */
+    int64_t rid;                  /* ArgID. Not useful now  */
+    uint8_t bam_paired;           /* indicate whether member baln is BamAlignments or PairedAlignments */
+    void *free_ptr;               /* Pointer to destroy the ArrayList wrapper */
 } ParallelizerArg;
 
 typedef struct {
     char *barcode;
     char *annotation;
     uint8_t spliced_annotation;
+    uint8_t is_rmsk;
 } ParallelizerResult;
 
 void ParallelizerArgClean(void *arg)
 {
     ParallelizerArg *pa = (ParallelizerArg *)arg;
-    for (size_t i = 0; i < pa->n_bam_alignments; ++i) {
-        BamAlignmentDestroy(pa->baln[i]);
+    if (pa->bam_paired) {
+        for (size_t i = 0; i < pa->n_bam_alignments; ++i) {
+            PairedAlignmentDestroy(pa->aln[i]);
+        }
+    } else {
+        for (size_t i = 0; i < pa->n_bam_alignments; ++i) {
+            BamAlignmentDestroy(pa->aln[i]);
+        }
     }
+    ArrayListDestroy(pa->free_ptr);
     free(pa);
 }
 
@@ -505,68 +572,178 @@ void molecularCountParallelizer(void *arg) {
     ParallelizerResult *result;
     ArrayList *par_result = ArrayListCreate(pa->n_bam_alignments);
     ArrayListSetDeallocationFunction(par_result, free);
-    for (size_t i = 0; i < pa->n_bam_alignments; ++i) {
-        if (annotateBam(pa->fp, pa->baln[i], pa->attr_name) == 0) {
-            char *annotation = pa->baln[i]->annotation;
-            result = malloc(sizeof(ParallelizerResult));
-            result->barcode = pa->baln[i]->barcode;
-            result->annotation = annotation;
-            result->spliced_annotation = pa->baln[i]->spliced_annotation;
-            ArrayListPush(par_result, result);
+    uint8_t ret;
+    if (pa->bam_paired) {
+        for (size_t i = 0; i < pa->n_bam_alignments; ++i) {
+            if (pa->rmsk_mtx) {
+                ret = annotateBamPairedRmsk(pa->fp,
+                                    pa->rmsk, 
+                                    pa->aln[i],
+                                    pa->attr_name,
+                                    pa->rmsk_attr_name);
+            } else {
+                ret = annotateBamPaired(pa->fp, 
+                                pa->aln[i], 
+                                pa->attr_name);
+            }
+            if (ret == 0) {
+                char *annotation = ((PairedAlignment *) pa->aln[i])->annotation;
+                result = malloc(sizeof(ParallelizerResult));
+                result->barcode = ((PairedAlignment *) pa->aln[i])->barcode;
+                result->annotation = annotation;
+                result->spliced_annotation = ((PairedAlignment *) pa->aln[i])->spliced_annotation;
+                result->is_rmsk = ((PairedAlignment *) pa->aln[i])->is_rmsk;
+                ArrayListPush(par_result, result);
+            }
+        }
+    } else {
+        for (size_t i = 0; i < pa->n_bam_alignments; ++i) {
+            
+            if (pa->rmsk != NULL) {
+                ret = annotateBamRmsk(pa->fp, 
+                                    pa->rmsk, 
+                                    pa->aln[i],
+                                    pa->attr_name,
+                                    pa->rmsk_attr_name);
+            } else {
+                ret = annotateBam(pa->fp, 
+                                pa->aln[i], 
+                                pa->attr_name);
+            }
+            if (ret == 0) {
+                char *annotation = ((BamAlignment *) pa->aln[i])->annotation;
+                result = malloc(sizeof(ParallelizerResult));
+                result->barcode = ((BamAlignment *) pa->aln[i])->barcode;
+                result->annotation = annotation;
+                result->spliced_annotation = ((BamAlignment *) pa->aln[i])->spliced_annotation;
+                result->is_rmsk = ((BamAlignment *) pa->aln[i])->is_rmsk;
+                ArrayListPush(par_result, result);
+            }
         }
     }
-    while (pthread_mutex_trylock(&pa->mtx->mu) != 0);
+    pthread_mutex_lock(&pa->mtx->mu);
+    if (pa->rmsk_mtx) pthread_mutex_lock(&pa->rmsk_mtx->mu);
+
     ArrayListForEach(par_result, result, {
-        ExpressionMatrixInc(pa->mtx, result->barcode, result->annotation, result->spliced_annotation, 0);
+        if (result->is_rmsk) {
+            ExpressionMatrixInc(pa->rmsk_mtx, result->barcode, result->annotation, 1, 0);
+        } else {
+            ExpressionMatrixInc(pa->mtx, result->barcode, result->annotation,   result->spliced_annotation, 0);
+        }
     })
+
+    if (pa->rmsk_mtx) pthread_mutex_unlock(&pa->rmsk_mtx->mu);
     pthread_mutex_unlock(&pa->mtx->mu);
     ArrayListDestroy(par_result);
     ParallelizerArgClean(arg);
 }
 
-uint8_t molecularCount(char *bgtf_path, 
-                    char *attr_name, 
-                    char *bam_path,
+uint8_t molecularCountInternal(
+                    BGTF *rfp,
+                    BGTF *tfp,
+                    BGZF *ofp,
+                    char *attr_name,
+                    char *rmsk_attr_name, 
+                    ExpressionMatrix_t *matrix,
+                    ExpressionMatrix_t *rmsk_matrix,
                     char *bam_tag,
+                    uint8_t bam_paired,
+                    char *bam_barcode,
+                    int n_threads,
+                    uint32_t n_alignment_per_thread,
+                    BamFile_t *bamfile
+                );
+
+uint8_t molecularCount(char *bgtf_path, 
+                    char *rmsk_path, 
+                    char *attr_name,
+                    char *rmsk_attr_name, 
+                    char *bam_path,
+                    char *bam_dir,
+                    char *bam_tag,
+                    uint8_t bam_paired,
                     char *barcode_path,
                     char *output_path,
                     char *bam_output_path,
-                    int n_threads)
+                    int n_threads,
+                    uint32_t n_alignment_per_thread)
 {
-    /* Begin: These declarations are used for multi-thread argument */
-    tpool_t *p;
-    tpool_process_t *q;
-    if (n_threads > 1) {
-        pthread_setconcurrency(2);
-        p = tpool_init(n_threads);
-        q = tpool_process_init(p, 16, true);
-    }
-    size_t n_par_data = 0;
-    int blk;
-    ParallelizerResult *result;
-    ParallelizerArg *arg;
-    BamAlignment **baln_ptr;
-    size_t partition_size;
-    ArrayList *par_data;
-    /* End: These declarations are used for multi-thread argument */
+    log("Using arguments:")
 
-    BGTF *rfp = BGTFInit();
-    BGTFLoad(rfp, bgtf_path, attr_name);
-    BamFile_t *bamfile = BamOpen(bam_path);
-    BamAlignment *baln;
-    HashTable *barcodeIndex = readBarcodeFile(barcode_path);
-    BGZF *ofp;
-    if (bam_output_path) {
-        ofp = bgzf_open(bam_output_path, "wb+");
-        bam_hdr_write(ofp, bamfile->bam_hdr);
+    logf("BAM CellBarcode tag: %s", bam_tag);
+    logf("Using (%d/%d) threads", n_threads, MAX_THREADS);
+
+    BGTF *rfp = NULL;
+    BGTF *tfp = NULL;
+    BGZF *ofp = NULL;
+    
+    if (bgtf_str_endswith(bgtf_path, "bgtf")) {
+        rfp = BGTFInit();
+        BGTFLoad(rfp, bgtf_path, attr_name);
+    } else if (bgtf_str_endswith(bgtf_path, "gtf")) {
+        rfp = GTFRead(bgtf_path, attr_name);
+    } else {
+        fatalf("The input reference file %s has wrong extension. \n"
+               "Please check whether the file ends with .gtf or .bgtf", bgtf_path);
     }
-    ExpressionMatrix_t *matrix = ExpressionMatrixInit(HashTableSize(barcodeIndex), HashTableSize(rfp->attr_table), 0);
+
+    
+    if (rmsk_path) {
+        if (bgtf_str_endswith(rmsk_path, "bgtf")) {
+            tfp = BGTFInit();
+            BGTFLoad(tfp, rmsk_path, rmsk_attr_name);
+        } else if (bgtf_str_endswith(rmsk_path, "gtf")) {
+            tfp = GTFRead(rmsk_path, attr_name);
+        } else {
+            fatalf("The input reference file %s has wrong extension. \n "
+            "Please check whether the file ends with .gtf or .bgtf", rmsk_path);
+        }
+    }
+
+    BamFile_t *bamfile;
+
+    if (bam_path) {
+        bamfile = BamOpen(bam_path);
+        if (bam_output_path) {
+            ofp = bgzf_open(bam_output_path, "wb+");
+            bam_hdr_write(ofp, bamfile->bam_hdr);
+        }
+    }
+
+    HashTable *barcodeIndex;
+
+    uint8_t free_bam_dir = 0;
+    if (bam_dir && (bam_dir[strlen(bam_dir)-1]) != '/') {
+        char *bam_dir_ = bam_dir;
+        bam_dir =  malloc(strlen(bam_dir_) + 2);
+        memset(bam_dir, 0, strlen(bam_dir_) + 2);
+        memcpy(bam_dir, bam_dir_, strlen(bam_dir_));
+        bam_dir[strlen(bam_dir_)] = '/';
+        free_bam_dir = 1;
+    }
+
+    if (barcode_path) {
+        barcodeIndex = readBarcodeFile(barcode_path);
+    } else {
+        barcodeIndex = bgtf_listdir(bam_dir, NULL, "bam");
+    }
+
+    ExpressionMatrix_t *matrix = ExpressionMatrixInit(HashTableSize(barcodeIndex), HashTableSize(rfp->attr_table), 0, 0);
+    ExpressionMatrix_t *rmsk_matrix = NULL;
     ExpressionMatrixInitSetColIndex(matrix, rfp->attr_table);
     ExpressionMatrixInitSetRowIndex(matrix, barcodeIndex);
-    if (n_threads > 1) {
-        ExpressionMatrixSetMt(matrix);
+
+    if (rmsk_path) {
+        rmsk_matrix = ExpressionMatrixInit(HashTableSize(barcodeIndex), HashTableSize(tfp->attr_table), 0, 1);
+        ExpressionMatrixInitSetColIndex(rmsk_matrix, tfp->attr_table);
+        ExpressionMatrixInitSetRowIndex(rmsk_matrix, barcodeIndex);
+        if (n_threads > 1) {
+            ExpressionMatrixSetMt(rmsk_matrix);
+        }
     }
-    char *barcode, *annotation;
+
+
+    
     char *k;
     size_t attr_idx;
     ArrayList *sort_arr;
@@ -574,23 +751,23 @@ uint8_t molecularCount(char *bgtf_path,
     HashTableForEach(rfp->attr_table, k, attr_idx, {
         ArrayListPush(sort_arr, k);
     })
-    if ((output_path[strlen(output_path)-1]) != '/') {
+    
+    uint8_t free_output_path = 0;
+    if (output_path && (output_path[strlen(output_path)-1]) != '/') {
         char *output_path_ = output_path;
         output_path =  malloc(strlen(output_path_) + 2);
         memset(output_path, 0, strlen(output_path_) + 2);
         memcpy(output_path, output_path_, strlen(output_path_));
         output_path[strlen(output_path_)] = '/';
+        free_output_path = 1;
     }
-    char *gene_name_output_path = malloc(strlen(output_path) + 13);
-    memset(gene_name_output_path, 0, strlen(output_path) + 13);
-    memcpy(gene_name_output_path, output_path, strlen(output_path));
-    memcpy(gene_name_output_path + strlen(output_path), "features.tsv", 12);
+
+    char *gene_name_output_path = bgtf_str_concat(output_path, "features.tsv");
     FILE *gene_name_out;
     if (!(gene_name_out = fopen(gene_name_output_path, "w+"))) {
         fatalf("failed to open %s", gene_name_output_path);
     }
-    
-    logf("Output features names to %s", gene_name_output_path);
+    logf("Output features name to %s", gene_name_output_path);
     ArrayListSort(sort_arr, strcmp);
     ArrayListForEach(sort_arr, k, {
         fprintf(gene_name_out, "%s\n", k);
@@ -598,15 +775,32 @@ uint8_t molecularCount(char *bgtf_path,
     ArrayListDestroy(sort_arr);
     fclose(gene_name_out);
     free(gene_name_output_path);
-
-    sort_arr = ArrayListCreate(HashTableSize(rfp->attr_table));
+    
+    if (rmsk_path) {
+        char *rmsk_name_output_path;
+        rmsk_name_output_path = bgtf_str_concat(output_path, "rmsk_features.tsv");        
+        logf("Output features name to %s", rmsk_name_output_path);
+        FILE *rmsk_name_out;
+        if (!(rmsk_name_out = fopen(rmsk_name_output_path, "w+"))) {
+            fatalf("failed to open %s", rmsk_name_output_path);
+        }
+        sort_arr = ArrayListCreate(HashTableSize(tfp->attr_table));
+        HashTableForEach(tfp->attr_table, k, attr_idx, {
+            ArrayListPush(sort_arr, k);
+        })
+        ArrayListSort(sort_arr, strcmp);
+        ArrayListForEach(sort_arr, k, {
+            fprintf(rmsk_name_out, "%s\n", k);
+        })
+        ArrayListDestroy(sort_arr);
+        fclose(rmsk_name_out);
+        free(rmsk_name_output_path);
+    }
+    sort_arr = ArrayListCreate(HashTableSize(barcodeIndex));
     HashTableForEach(barcodeIndex, k, attr_idx, {
         ArrayListPush(sort_arr, k);
     })
-    char *barcode_output_path = malloc(strlen(output_path) + 13);
-    memset(barcode_output_path, 0, strlen(output_path) + 13);
-    memcpy(barcode_output_path, output_path, strlen(output_path));
-    memcpy(barcode_output_path + strlen(output_path), "barcodes.tsv", 12);
+    char *barcode_output_path = bgtf_str_concat(output_path, "barcodes.tsv");
     FILE *barcode_out;
     if (!(barcode_out = fopen(barcode_output_path, "w+"))) {
         fatalf("Failed to open %s", barcode_output_path);
@@ -620,88 +814,50 @@ uint8_t molecularCount(char *bgtf_path,
     fclose(barcode_out);
     free(barcode_output_path);
     ArrayListDestroy(sort_arr);
-    log("Start counting molecules");
-    size_t n_alignment = 0, n_annotation = 0;
-    if (n_threads == 1) {
-        while (baln = parseOneAlignment(bamfile)) {
-            // printf("read name %s\n", bam_get_qname(bamfile->aln));
-            if (annotateBam(rfp, baln, attr_name) == 0) {
-                // Successful annotation
-                n_annotation++;
-                barcode = bam_aux_get(bamfile->aln, bam_tag);
-                barcode = barcode + 1;
-                annotation = baln->annotation;
-                ExpressionMatrixInc(matrix, barcode, annotation, baln->spliced_annotation, 0);
-                if (bam_output_path) {
-                    bam_aux_update_str(bamfile->aln, "CT", strlen(annotation), annotation);
-                    if (baln->spliced_annotation) {
-                        bam_aux_update_str(bamfile->aln, "PT", 8, "spliced");
-                    } else {
-                        bam_aux_update_str(bamfile->aln, "PT", 10, "unspliced");
-                    }
-                    bam_write1(ofp, bamfile->aln);
-                }
-            } else {
-                if (bam_output_path) {
-                    bam_aux_update_str(bamfile->aln, "PT", 10, "unassigned");
-                    bam_write1(ofp, bamfile->aln);
-                }
-            }; 
-            n_alignment++;
-            if (n_alignment % 1000000 == 0) {
-                logf("Count %llu reads", n_alignment);
-            }
-            BamAlignmentDestroy(baln);
-        }
-    } else {
-        par_data = ArrayListCreate(1000000);
-        while (baln = parseOneAlignment(bamfile)) {
-            barcode = bam_aux_get(bamfile->aln, bam_tag);
-            barcode = barcode + 1;
-            baln->barcode = malloc(strlen(barcode)+1);
-            memset(baln->barcode, 0, strlen(barcode)+1);
-            memcpy(baln->barcode, barcode, strlen(barcode));
-            ArrayListPush(par_data, baln);
-            n_par_data++;
-            n_alignment++;
-            
-            if (n_par_data % (1000000 * n_threads) == 0) {
-                
-                logf("Count %llu reads", n_alignment);
-                // Begin flushing
-                ArrayListPartition(par_data, n_threads, baln_ptr, partition_size, {
-                    arg = malloc(sizeof(ParallelizerArg));
-                    arg->attr_name = attr_name;
-                    arg->fp = rfp;
-                    arg->mtx = matrix;
-                    arg->n_bam_alignments = partition_size;
-                    arg->baln = baln_ptr;
-                    blk = tpool_dispatch(p, q, molecularCountParallelizer, (void *)arg, NULL, NULL, true);
-                });
-                tpool_process_flush(q);
-                ArrayListDestroy(par_data);
-                par_data = ArrayListCreate(1000000);
-                n_par_data = 0;
-                // End flushing
-            }
-        }
-    }
-    logf("Count %llu reads", n_alignment);
-    // Begin flushing
-    ArrayListPartition(par_data, n_threads, baln_ptr, partition_size, {
-        logf("partition_size = %llu", partition_size);
-        arg = malloc(sizeof(ParallelizerArg));
-        arg->attr_name = attr_name;
-        arg->fp = rfp;
-        arg->mtx = matrix;
-        arg->n_bam_alignments = partition_size;
-        arg->baln = baln_ptr;
-        blk = tpool_dispatch(p, q, molecularCountParallelizer, (void *)arg, NULL, NULL, true);
-    });
-    tpool_process_flush(q);
-    ArrayListDestroy(par_data);
-    log("Counting finished");
 
+
+    log("Start counting molecules");
+    if (bam_path) {
+        molecularCountInternal(
+            rfp, 
+            tfp, 
+            ofp,
+            attr_name,
+            rmsk_attr_name,
+            matrix,
+            rmsk_matrix,
+            bam_tag,
+            bam_paired,
+            NULL,
+            n_threads,
+            n_alignment_per_thread,
+            bamfile);
+    } else {
+        size_t idx;
+        HashTableForEach(barcodeIndex, bam_path, idx, {
+            logf("Processing %s", bam_path);
+            bamfile = BamOpen(bam_path);
+                molecularCountInternal(
+                    rfp, 
+                    tfp, 
+                    ofp,
+                    attr_name,
+                    rmsk_attr_name,
+                    matrix,
+                    rmsk_matrix,
+                    bam_tag,
+                    bam_paired,
+                    bam_path, // cell barcode provided here
+                    n_threads,
+                    n_alignment_per_thread,
+                    bamfile
+                );
+            BamClose(bamfile);
+        });
+    }
+
+
+    log("Counting finished");
     char *mtx_output_path = calloc(strlen(output_path) + 12, 1);
     memcpy(mtx_output_path, output_path, strlen(output_path));
     memcpy(mtx_output_path + strlen(output_path), "spliced.mtx", 11);
@@ -717,20 +873,34 @@ uint8_t molecularCount(char *bgtf_path,
     if (!(unspliced = fopen(mtx_output_path, "w+"))) {
         fatalf("Failed to open %s", mtx_output_path);
     };
+    free(mtx_output_path);
+    mtx_output_path = calloc(strlen(output_path) + 9, 1);
+    memcpy(mtx_output_path, output_path, strlen(output_path));
+    memcpy(mtx_output_path + strlen(output_path), "rmsk.mtx", 8);
+    FILE *rmsk;
+    if (rmsk_path) {
+        if (!(rmsk = fopen(mtx_output_path, "w+"))) {
+            fatalf("Failed to open %s", mtx_output_path);
+        };
+    }
+    free(mtx_output_path);
+    if (free_output_path) free(output_path);
+    if (free_bam_dir) free(bam_dir);
     log("Writing count matrix");
     ExpressionMatrixToFile(matrix, spliced, unspliced);
-    free(mtx_output_path);
+    if (rmsk_path) {
+        ExpressionMatrixToFile_(rmsk_matrix, rmsk);
+    }
     fclose(spliced);
     fclose(unspliced);
-    if (n_threads > 1) {
-        ExpressionMatrixUnsetMt(matrix);
-        tpool_process_destroy(q);
-        tpool_destroy(p);
-        pthread_exit(NULL);
-    }
+    if (rmsk_path) fclose(rmsk);
     ExpressionMatrixDestroy(matrix);
+    if (rmsk_path) {
+        ExpressionMatrixDestroy(rmsk_matrix);
+        if (n_threads > 1) ExpressionMatrixUnsetMt(rmsk_matrix);
+    }
     destroyBarcodeTable(barcodeIndex);
-    BamClose(bamfile);
+    if (!bam_dir) BamClose(bamfile);
     if (bam_output_path) {
         bgzf_close(ofp);
     }
@@ -738,14 +908,33 @@ uint8_t molecularCount(char *bgtf_path,
 }
 
 
-/* Command-line functions */
+/* Command-line function */
 void count_usage()
 {
-    
+    fprintf(stdout,    
+"Usage:   bgtf count [options]\n"
+"\n"
+"Arguments:\n"
+"   Required arguments:\n"
+"     -c          [PATH]   Cell barcode file \n"
+"     -i          [STRING] BAM tag of barcode. Default is CB \n"
+"     -g          [STRING] feature name to be counted \n"
+"     -r          [PATH]   Gene BGTF file \n"
+"   Optional arguments:\n"
+"     -b          [PATH]   Input BAM file \n"
+"     -B          [PATH]   output gene annotation to a BAM file if set \n"
+"     -d          [PATH]   Input BAM directory \n"
+"     -m          [PATH]   RMSK BGTF file. Mask TE if set \n"
+"     -t          [INT]    n parallel thread if setted \n"
+"     -T          [INT]    n alignment to process in one thread. Default is 1000000 \n"
+"\n");
     return;
 }
 void count_version()
 {
+    fprintf(stdout,    
+"bgtf count version %s\n", BGTF_COUNT_VERSION
+    );
     return;
 }
 
@@ -753,33 +942,46 @@ int count_main(int argc, char *argv[])
 {
     int c;
     char *file_path = NULL;
+    char *rmsk_path = NULL;
     char *output_path = NULL;
     char *bam_path = NULL;
+    char *bam_dir = NULL;
     char *bam_output_path = NULL;
     char *bam_tag = NULL;
     char *barcode_path = NULL;
     char *attr;
     int ret;
+    uint8_t paired = 0;
     int n_threads = 1;
+    uint32_t n_alignment_per_thread = 1000000;
     while (1)
     {
         static struct option long_options[] =
             {   
-                {"bamOutput", required_argument, 0, 'B'},
-                {"bamFile", required_argument, 0, 'b'},
-                {"cellBarcode", required_argument, 0, 'c'},
-                {"bamTag", required_argument, 0, 'i'},
+                {"bamOutput", optional_argument, 0, 'B'},
+                {"bamFile", optional_argument, 0, 'b'},
+                {"cellBarcode", optional_argument, 0, 'c'},
+                {"bamDir", optional_argument, 0, 'd'},
                 {"attrName", required_argument, 0, 'g'},
+                {"bamTag", required_argument, 0, 'i'},
+                {"rmsk", optional_argument, 0, 'm'},
                 {"gtf", required_argument, 0, 'r'},
                 {"output", required_argument, 0, 'o'},
-                {"nthreads", optional_argument, 0, 'p'},
+                {"nthreads", optional_argument, 0, 't'},
+                {"nalignment", optional_argument, 0, 'T'},
+                {"paired", no_argument, 0, 'p'},
                 {"help", no_argument, NULL, 'h'},
                 {"version", no_argument, NULL, 'v'},
                 {0, 0, 0, 0}
             };
         /* getopt_long stores the option index here. */
         int option_index = 0;
-        c = getopt_long(argc, argv, "B:b:c:g:hi:o:p:r:v", long_options, &option_index);
+        c = getopt_long(argc, 
+            argv, 
+            "B:b:c:d:g:hi:m:o:pt:T:r:v", 
+            long_options, 
+            &option_index
+        );
 
         /* Detect the end of the options. */
         if (c == -1)
@@ -804,6 +1006,9 @@ int count_main(int argc, char *argv[])
             break;  
         case 'c':
             barcode_path = optarg;
+            break;
+        case 'd':
+            bam_dir = optarg;
             break;  
         case 'g':
             attr = optarg;
@@ -811,14 +1016,23 @@ int count_main(int argc, char *argv[])
         case 'i':
             bam_tag = optarg;
             break;
+        case 'm':
+            rmsk_path = optarg;
+            break;
         case 'r':
             file_path = optarg;
             break; 
         case 'o':
             output_path = optarg;
             break;
-        case 'p':
+        case 't':
             n_threads = MIN(strtol(optarg, NULL, 10), MAX_THREADS);
+            break;
+        case 'T':
+            n_alignment_per_thread = MAX(strtol(optarg, NULL, 10), 1000000);
+            break;
+        case 'p':
+            paired = 1;
             break;
         case 'h':
             count_usage();
@@ -828,11 +1042,314 @@ int count_main(int argc, char *argv[])
             exit(0);
         }
     }
-    logf("Using (%d/%d) threads", n_threads, MAX_THREADS);
+    
     if ((bam_output_path != NULL) && (n_threads > 1)) {
         warnf("Outputing BAM with multi-thread option is not yet supported");
         bam_output_path = NULL;
     }
-    ret = molecularCount(file_path, attr, bam_path, bam_tag, barcode_path, output_path, bam_output_path, n_threads);
+
+    if ((bam_dir != NULL) && (bam_output_path != NULL)) {
+        warnf("Outputing BAM with BAM file directory is not yet supported");
+        bam_output_path = NULL;
+    }
+
+    if (!bam_path && !bam_dir) {
+        fatalf("Either bam_path or bam_dir should be specified.")
+    }
+
+    if (bam_path && bam_dir) {
+        warn("both bam_path and bam_dir specified. Only considering bam_path");
+        bam_dir = NULL;
+    }
+
+    ret = molecularCount(
+        file_path, 
+        rmsk_path, 
+        attr, 
+        "gene_id",  // this argument is hard-coded for now
+        bam_path, 
+        bam_dir,
+        bam_tag,
+        paired,
+        barcode_path, 
+        output_path, 
+        bam_output_path, 
+        n_threads,
+        n_alignment_per_thread
+    );
     return ret;
+}
+
+uint8_t molecularCountInternal(
+    BGTF *rfp,
+    BGTF *tfp,
+    BGZF *ofp,
+    char *attr_name,
+    char *rmsk_attr_name,
+    ExpressionMatrix_t *matrix,
+    ExpressionMatrix_t *rmsk_matrix,
+    char *bam_tag,
+    uint8_t bam_paired,
+    char *bam_barcode,
+    int n_threads,
+    uint32_t n_alignment_per_thread,
+    BamFile_t *bamfile)
+{
+    /* Begin: These declarations are used for multi-thread argument */
+    size_t n_par_data = 0;
+    int blk;
+    ParallelizerResult *result = NULL;
+    ParallelizerArg *arg = NULL;
+    void **aln_ptr = NULL;
+    ArrayList *par_data = NULL;
+    /* End: These declarations are used for multi-thread argument */
+
+    BamAlignment *baln = NULL;
+    PairedAlignment *paln = NULL;
+    char *barcode, *annotation;
+    size_t n_alignment = 0, n_annotation = 0;
+    if (n_threads == 1)
+    {
+        if (!bam_paired)
+        {
+            while (baln = parseOneAlignment(bamfile))
+            {
+                // printf("read name %s\n", bam_get_qname(bamfile->aln));
+                uint8_t ret;
+                if (tfp)
+                {
+                    ret = annotateBamRmsk(rfp, tfp, baln, attr_name, rmsk_attr_name);
+                }
+                else
+                {
+                    ret = annotateBam(rfp, baln, attr_name);
+                }
+                if (ret == 0)
+                {
+                    // Successful annotation
+                    n_annotation++;
+
+                    if (bam_barcode)
+                    {
+                        barcode = bam_barcode;
+                    }
+                    else
+                    {
+                        barcode = bam_aux_get(bamfile->aln, bam_tag) + 1;
+                    }
+
+                    annotation = baln->annotation;
+                    if (baln->is_rmsk)
+                    {
+                        ExpressionMatrixInc(rmsk_matrix, barcode, annotation, 1, 0);
+                    }
+                    else
+                    {
+                        ExpressionMatrixInc(matrix, barcode, annotation, baln->spliced_annotation, 0);
+                    }
+                    if (ofp)
+                    {
+                        bam_aux_update_str(bamfile->aln, "CT", strlen(annotation), annotation);
+                        if (baln->spliced_annotation)
+                        {
+                            bam_aux_update_str(bamfile->aln, "PT", 8, "spliced");
+                        }
+                        else
+                        {
+                            bam_aux_update_str(bamfile->aln, "PT", 10, "unspliced");
+                        }
+                        bam_write1(ofp, bamfile->aln);
+                    }
+                }
+                else
+                {
+                    if (ofp)
+                    {
+                        bam_aux_update_str(bamfile->aln, "PT", 10, "unassigned");
+                        bam_write1(ofp, bamfile->aln);
+                    }
+                };
+                n_alignment++;
+                if (n_alignment % 1000000 == 0)
+                {
+                    logf("Count %llu reads", n_alignment);
+                }
+                BamAlignmentDestroy(baln);
+            }
+        }
+        else
+        {
+            PairedAlignmentIterator_t *it = PairedAlignmentIteratorInit();
+
+            while (paln = parsePairedAlignment(it, bamfile, bam_tag, bam_barcode))
+            {
+                uint8_t ret;
+                if (rmsk_matrix)
+                {
+                    ret = annotateBamPairedRmsk(rfp, tfp, paln, attr_name, rmsk_attr_name);
+                }
+                else
+                {
+                    ret = annotateBamPaired(rfp, paln, attr_name);
+                }
+                if (ret == 0)
+                {
+                    // Successful annotation
+                    n_annotation++;
+                    barcode = paln->barcode;
+                    annotation = paln->annotation;
+
+                    if (paln->is_rmsk)
+                    {
+                        ExpressionMatrixInc(rmsk_matrix, barcode, annotation, 1, 0);
+                    }
+                    else
+                    {
+                        ExpressionMatrixInc(matrix, barcode, annotation, paln->spliced_annotation, 0);
+                    }
+                }
+                n_alignment++;
+                if (n_alignment % 1000000 == 0)
+                {
+                    logf("Count %llu reads", n_alignment);
+                }
+                HashTableRemove(it->read_table, paln->qname);
+                PairedAlignmentDestroy(paln);
+            }
+            PairedAlignmentIteratorDestroy(it);
+        }
+    }
+    else
+    {
+        tpool_t *p;
+        tpool_process_t *q;
+        pthread_setconcurrency(2);
+        p = tpool_init(n_threads);
+        q = tpool_process_init(p, 16, true);
+        ExpressionMatrixSetMt(matrix);
+    
+
+        par_data = ArrayListCreate(1000000);
+        if (bam_paired)
+        {
+            PairedAlignmentIterator_t *it = PairedAlignmentIteratorInit();
+            while (paln = parsePairedAlignment(it, bamfile, bam_tag, bam_barcode))
+            {
+                barcode = paln->barcode;
+                ArrayListPush(par_data, paln);
+                n_par_data++;
+                n_alignment++;
+                if (n_par_data % n_alignment_per_thread == 0)
+                {
+                    logf("Count %llu reads", n_alignment);
+                    // Begin flushing
+                    aln_ptr = par_data->elementList;
+                    arg = malloc(sizeof(ParallelizerArg));
+                    memset(arg, 0, sizeof(ParallelizerArg));
+                    arg->attr_name = attr_name;
+                    arg->rmsk_attr_name = rmsk_attr_name;
+                    arg->fp = rfp;
+                    arg->rmsk = tfp;
+                    arg->mtx = matrix;
+                    arg->rmsk_mtx = rmsk_matrix;
+                    arg->n_bam_alignments = n_alignment_per_thread;
+                    arg->aln = aln_ptr;
+                    arg->rid = n_alignment;
+                    arg->free_ptr = par_data;
+                    arg->bam_paired = 1;
+                    blk = tpool_dispatch(p, q, molecularCountParallelizer, (void *)arg, NULL, NULL, true);
+                    par_data = ArrayListCreate(n_alignment_per_thread);
+                    n_par_data = 0;
+                }
+            }
+            logf("Count %llu reads", n_alignment);
+            // Begin flushing
+            aln_ptr = par_data->elementList;
+            arg = malloc(sizeof(ParallelizerArg));
+            memset(arg, 0, sizeof(ParallelizerArg));
+            arg->attr_name = attr_name;
+            arg->rmsk_attr_name = rmsk_attr_name;
+            arg->fp = rfp;
+            arg->rmsk = tfp;
+            arg->mtx = matrix;
+            arg->rmsk_mtx = rmsk_matrix;
+            arg->n_bam_alignments = n_par_data;
+            arg->aln = aln_ptr;
+            arg->free_ptr = par_data;
+            arg->rid = n_alignment;
+            arg->bam_paired = 1;
+            blk = tpool_dispatch(p, q, molecularCountParallelizer, (void *)arg, NULL, NULL, true);
+            tpool_process_flush(q);
+            PairedAlignmentIteratorDestroy(it);
+        }
+        else
+        {
+            while (baln = parseOneAlignment(bamfile))
+            {
+                if (bam_barcode)
+                {
+                    barcode = bam_barcode;
+                }
+                else
+                {
+                    barcode = bam_aux_get(bamfile->aln, bam_tag) + 1;
+                }
+                baln->barcode = malloc(strlen(barcode) + 1);
+                memset(baln->barcode, 0, strlen(barcode) + 1);
+                memcpy(baln->barcode, barcode, strlen(barcode));
+                ArrayListPush(par_data, baln);
+                n_par_data++;
+                n_alignment++;
+
+                if (n_par_data % n_alignment_per_thread == 0)
+                {
+
+                    logf("Count %llu reads", n_alignment);
+                    // Begin flushing
+                    aln_ptr = par_data->elementList;
+
+                    arg = malloc(sizeof(ParallelizerArg));
+                    memset(arg, 0, sizeof(ParallelizerArg));
+                    arg->attr_name = attr_name;
+                    arg->rmsk_attr_name = rmsk_attr_name;
+                    arg->fp = rfp;
+                    arg->rmsk = tfp;
+                    arg->mtx = matrix;
+                    arg->rmsk_mtx = rmsk_matrix;
+                    arg->n_bam_alignments = n_alignment_per_thread;
+                    arg->aln = aln_ptr;
+                    arg->rid = n_alignment;
+                    arg->bam_paired = 0;
+                    arg->free_ptr = par_data;
+                    /* Block if there are maximum jobs ! */
+                    blk = tpool_dispatch(p, q, molecularCountParallelizer, (void *)arg, NULL, NULL, true);
+                    par_data = ArrayListCreate(n_alignment_per_thread);
+                    n_par_data = 0;
+                    // End flushing
+                }
+            }
+            logf("Count %llu reads", n_alignment);
+            // Begin flushing
+            aln_ptr = par_data->elementList;
+            arg = malloc(sizeof(ParallelizerArg));
+            memset(arg, 0, sizeof(ParallelizerArg));
+            arg->attr_name = attr_name;
+            arg->rmsk_attr_name = rmsk_attr_name;
+            arg->fp = rfp;
+            arg->rmsk = tfp;
+            arg->mtx = matrix;
+            arg->rmsk_mtx = rmsk_matrix;
+            arg->n_bam_alignments = n_par_data;
+            arg->aln = aln_ptr;
+            arg->rid = n_alignment;
+            arg->free_ptr = par_data;
+            arg->bam_paired = 0;
+            blk = tpool_dispatch(p, q, molecularCountParallelizer, (void *)arg, NULL, NULL, true);
+            tpool_process_flush(q);
+        }
+        ExpressionMatrixUnsetMt(matrix);
+        tpool_process_destroy(q);
+        tpool_destroy(p);
+    }
+    return 0;
 }

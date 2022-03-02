@@ -77,7 +77,7 @@ char *getRecordAttrKV_helper(RecordAttrKV_t *attr, uint32_t magic)
     case TRANSCRIPT_NAME:
         return attr->transcript_name;
     case EXON_ID:
-        return attr->transcript_name;
+        return attr->exon_id;
     case FAMILY_ID:
         return attr->family_id;
     case CLASS_ID:
@@ -119,7 +119,7 @@ void BGTFRecordDestroy(BGTFRecord_t *record)
 BGTFHdr_t *BGTFHdrInit()
 {
     BGTFHdr_t *hdr = (BGTFHdr_t *)malloc(sizeof(BGTFHdr_t));
-    hdr->version = LIBBIGWIG_VERSION;
+    hdr->version = LIBBGTF_VERSION;
     return hdr;
 }
 
@@ -291,10 +291,21 @@ void destroyGenomicLocation(struct GenomicLocation *loc, void(*dealloc_data)(cha
 /* Command-line functions */
 void convert_usage()
 {
+    fprintf(stdout,    
+"Usage:   bgtf count [options]\n"
+"\n"
+"Arguments:\n"
+"   Required arguments:\n"
+"     -g          [PATH]   Input GTF file \n"
+"     -o          [PATH]   Output BGTF file  \n"
+"\n");
     return;
 }
 void convert_version()
 {
+    fprintf(stdout,    
+"bgtf convert version %s\n", BGTF_CONVERT_VERSION
+    );
     return;
 }
 
@@ -314,7 +325,7 @@ int convert_main(int argc, char *argv[])
                 {0, 0, 0, 0}};
         /* getopt_long stores the option index here. */
         int option_index = 0;
-        c = getopt_long(argc, argv, "g:o:h:v", long_options, &option_index);
+        c = getopt_long(argc, argv, "g:ho:v", long_options, &option_index);
 
         /* Detect the end of the options. */
         if (c == -1)
@@ -357,7 +368,7 @@ int convert_main(int argc, char *argv[])
             fatal("Argument capture failed\n");
         }
     }
-    BGTF *fp = GTFRead(file_path);
+    BGTF *fp = GTFRead(file_path, NULL);
     BGTFSave(fp, output_path, "wb+");
     BGTFClose(fp);
 }

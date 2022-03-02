@@ -93,12 +93,12 @@ static uint8_t inflate_block(BGTFRWBuffer_t *buffer, int block_length)
  * Read *
  ******/
 
-BGTF *GTFRead(char *path)
+BGTF *GTFRead(char *path, char *attr_name)
 {
     log("Loading GTF file");
     FILE *fp;
-    char buf[1024];
-    char readbuf[1024];
+    char buf[BGTF_IO_BUFFER_SIZE];
+    char readbuf[BGTF_IO_BUFFER_SIZE];
     uint8_t binary_checked = 0, sorted_checked = 0;
     if (!(fp = fopen(path, "r")))
     {
@@ -113,7 +113,7 @@ BGTF *GTFRead(char *path)
     // attach the record deallocator to the array list
     ArrayListSetDeallocationFunction(records, BGTFRecordDestroy);
     BGTFRecord_t *prev = NULL;
-    while (fgets(buf, 1024, fp) != NULL)
+    while (fgets(buf, BGTF_IO_BUFFER_SIZE, fp) != NULL)
     {
         if (!binary_checked)
         {
@@ -139,11 +139,11 @@ BGTF *GTFRead(char *path)
     file->records = records;
     if (sorted_checked)
         BGTFSortRecord(file);
-    BGTFBuildIndex(file, 0);
-
+    BGTFBuildIndex(file, attr_name);
+    
     char *chrom;
     BGTFRecordIdx *value;
-    RTree *rt;
+    RTree_t *rt;
     /*
     HashTableForEach(
         file->index->chrom_idx,
@@ -178,7 +178,7 @@ void BGTFAttrfprint (FILE *__stream__, RecordAttrKV_t *attr, char *k)
         fprintf(__stream__, "%s", attr->transcript_id);
         break;
     case TRANSCRIPT_VERSION:
-        fprintf(__stream__, "%s", attr->transcript_id);
+        fprintf(__stream__, "%s", attr->transcript_version);
         break;
     case TRANSCRIPT_NAME:
         fprintf(__stream__, "%s", attr->transcript_name);
@@ -270,7 +270,8 @@ static inline uint32_t deserializeString(RecordAttrKV_t *attr, char *src)
     uint32_t magic;
     memcpy(&c, src, 4);
     memcpy(&magic, src + 4, 4);
-    char *v = (char *)malloc(c);
+    char *v = (char *)malloc(c+1);
+    memset(v, 0, c+1);
     memcpy(v, src + 8, c);
     setRecordAttrKV_helper(attr, magic, v);
     return c + 8;
@@ -304,7 +305,6 @@ static inline void RecordAttrDeserialize(char *src,  RecordAttrKV_t *attr)
     memcpy(&(attr->gene_version), src + p + 2,  2);
     memcpy(&c, src, 4); // the total length of record string
     p = 8;
-
     while (c > 8) {
         slen = deserializeString(attr, src + p);
         p += slen;
@@ -349,7 +349,6 @@ static int BGTFSerializeRecord(void *dest, int *dlen, BGTFRecord_t *record, int 
 
 static BGTFRecord_t *BGTFDeserializeRecord(void *src)
 {
-
     BGTFRecord_t *record = (BGTFRecord_t *)malloc(sizeof(BGTFRecord_t));
     record->attrs = (RecordAttrKV_t *)malloc(sizeof(RecordAttrKV_t));
     memset(record->attrs, 0, sizeof(RecordAttrKV_t));
@@ -564,7 +563,7 @@ uint8_t BGTFRWRecords(BGTF *file, uint8_t mode)
             }
             blocksz = inflate_block(file->write->buffer, block_length);
 
-            ArrayListPush(file->records,  BGTFDeserializeRecord(file->write->buffer->uncompressed_block));
+            ArrayListPush(file->records, BGTFDeserializeRecord(file->write->buffer->uncompressed_block));
         }
     } else {
         ArrayListForEach(file->records, record, {
@@ -606,7 +605,7 @@ uint8_t BGTFReadChromList(FILE *__stream__, BGTF *file, size_t nitems)
 {
     fseek(__stream__, file->hdr->cl_offset, SEEK_SET);
     HashTable *chrom_table = file->index->chrom_idx;
-    char chrom[1024];
+    char chrom[BGTF_IO_BUFFER_SIZE];
     void *value;
     uint16_t chrom_len;
     for (size_t i = 0;  i < nitems; ++i) {
@@ -656,7 +655,7 @@ uint8_t BGTFReadHdr(FILE *__stream__, BGTF *file)
 
 uint8_t BGTFLoad(BGTF *file, char *path, char *attr_name)
 {
-    log("Loading BGTF file");
+    logf("Loading BGTF file %s", path);
     int errno;
     if (!file->is_write) {
         file->is_write = 1;
@@ -665,8 +664,8 @@ uint8_t BGTFLoad(BGTF *file, char *path, char *attr_name)
     if (errno = BGTFReadHdr(file->write->fp, file)) {
         fatalf("BGTFLoad error %d", errno);
     };
-    BGTFRWRecords(file, 1);  // Read binary records into memory
     logf("Total record %d", file->n_records);
+    BGTFRWRecords(file, 1);  // Read binary records into memory
     BGTFBuildIndex(file, attr_name);    // Build in-memory index
     log("Loading finished");
 }
@@ -674,7 +673,7 @@ uint8_t BGTFLoad(BGTF *file, char *path, char *attr_name)
 HashTable *readBarcodeFile(char *path)
 {
     FILE *fp;
-    char buf[1024];
+    char buf[BGTF_IO_BUFFER_SIZE];
     logf("Read barcode file %s", path);
     if (!(fp = fopen(path, "r"))) {
         fatalf("Read barcode file %s failed", path);
@@ -685,7 +684,7 @@ HashTable *readBarcodeFile(char *path)
     HashTableSetHashFunction(barcode_table, HashTableStringHashFunction);
     HashTableSetKeyComparisonFunction(barcode_table, strcmp);
     ArrayList *sort_arr = ArrayListCreate(0x2);
-    while (fgets(buf, 1024, fp) != NULL) {
+    while (fgets(buf, BGTF_IO_BUFFER_SIZE, fp) != NULL) {
         l = strlen(buf);
         buf[l-1] = '\0';
         char *b = malloc(l);
@@ -703,8 +702,54 @@ HashTable *readBarcodeFile(char *path)
     return barcode_table;
 }
 
+HashTable *bgtf_listdir(char *path, char *prefix, char *suffix)
+{
+    size_t idx = 1;
+    DIR *dir;
+    char *fname;
+    int prefix_l = 0, suffix_l = 0;
+    if (prefix) prefix_l = strlen(prefix);
+    if (suffix) suffix_l = strlen(suffix);
+    struct dirent *ent;
+    if ((dir = opendir(path)) != NULL) {
+        HashTable *dir_table = HashTableCreate(0x100);
+        HashTableSetHashFunction(dir_table, HashTableStringHashFunction);
+        HashTableSetKeyComparisonFunction(dir_table, strcmp);
+        ArrayList *sort_arr = ArrayListCreate(0x2);
+        
+        while ((ent = readdir(dir)) != NULL) {
+            fname = ent->d_name;
+            if (ent->d_type == DT_DIR) continue;
+            if ((prefix) && (strncmp(fname, prefix, prefix_l) != 0)) continue;
+            if ((suffix) && (strncmp(fname + strlen(fname) - suffix_l, suffix, suffix_l) != 0)) continue;
+            ArrayListPush(sort_arr, bgtf_str_concat(path, fname));
+        }
+        closedir(dir);
+        ArrayListSort(sort_arr, strcmp);
+        ArrayListForEach(sort_arr, fname, {
+            logf("%s", fname);
+            HashTablePut(dir_table, fname, idx);
+            idx++;
+        })
+        ArrayListDestroy(sort_arr);
+        return dir_table;
+    } else {
+        fatalf("The directory cannot be opened: %s", path);
+    }
+}
 void destroyBarcodeTable(HashTable *barcode_table)
 {
     HashTableSetDeallocationFunctions(barcode_table, free, NULL);
     HashTableDestroy(barcode_table);
+}
+
+int view_main(int argc, char *argv[])
+{
+    int c;
+    char *file_path = argv[1];
+    BGTF *rfp = BGTFInit();
+    BGTFLoad(rfp, file_path, NULL);
+    BGTFflushRecord(stdout, rfp, argv[2]);
+    BGTFClose(rfp);
+    return 0;
 }

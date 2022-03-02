@@ -4,6 +4,7 @@
 #include <zlib.h>
 #include "bgtf.h"
 #include "molcount.h"
+#include "bgtf-bam.h"
 
 /*! \file bgtfIO.h
  * These are (typically internal) IO functions, so there's generally no need for you to directly use them!
@@ -14,6 +15,8 @@
 #define BGTF_BLOCK_HEADER_LENGTH 18
 #define BGTF_BLOCK_FOOTER_LENGTH 8
 
+#define BGTF_IO_BUFFER_SIZE 1024
+
 enum BGTF_COMPRESS_ERR {
     BGTF_ERR_ZLIB   = 1,
     BGTF_ERR_HEADER = 2,
@@ -22,7 +25,7 @@ enum BGTF_COMPRESS_ERR {
 };
 
 
-BGTF *GTFRead(char *path);
+BGTF *GTFRead(char *path, char *attr_name);
 
 void BGTFfprint(FILE *__stream__, BGTFRecord_t *record, char *k);
 
@@ -34,5 +37,6 @@ uint8_t BGTFSave(BGTF *file, char *path, char *mode);
 uint8_t BGTFLoad(BGTF *file, char *path, char *attr_name);
 
 HashTable *readBarcodeFile(char *path);
+HashTable *bgtf_listdir(char *path, char *prefix, char *suffix);
 void BarcodeTableDestroy(HashTable *barcode_table);
 #endif 

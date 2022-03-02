@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <time.h>
+#include <dirent.h>
 #include <signal.h>
 #include <sys/ucontext.h>
 #include <sys/param.h>
@@ -116,8 +117,43 @@
     fprintf(stdout, "\n"); \
 } while (0);
 
+/* File operations */
 uint8_t is_binary(const void *buf, const size_t buf_len);
 
+/* String operations */
+char *bgtf_str_cpy(char *src);
+char *bgtf_str_concat(char *s1, char *s2);
+uint8_t bgtf_str_startswith(char *s, char *prefix);
+uint8_t bgtf_str_endswith(char *s, char *suffix);
+
+/* Hash operations */
+/**
+ * @brief __ac_X31_hash_string
+ * 
+ * @param key 
+ * @return uint32_t 
+ */
+static inline uint32_t __ac_X31_hash_string(const void *key) {
+    char *s = (char *)key;
+	uint32_t h = (uint32_t)*s;
+	if (h) for (++s ; *s; ++s) h = (h << 5) - h + (uint32_t)*s;
+	return h;
+}
+
+/**
+ * @brief __ac_X15_hash_string
+ * 
+ * @param key 
+ * @return uint15_t 
+ */
+static inline uint16_t __ac_X15_hash_string(const void *key) {
+    char *s = (char *)key;
+	uint16_t h = (uint16_t)*s;
+	if (h) for (++s ; *s; ++s) h = (h << 5) - h + (uint16_t)*s;
+	return h;
+}
+
+#ifdef BGTF_DEBUG
 static inline void crash_handler(int sig_num, siginfo_t *info, ucontext_t *ucontext)
 { /* when we crash, lets print out something usefull */
     void *array[50];
@@ -173,6 +209,6 @@ static inline void crash_handler(int sig_num, siginfo_t *info, ucontext_t *ucont
     }
     fatalf("exiting");
 }
-
+#endif
 
 #endif

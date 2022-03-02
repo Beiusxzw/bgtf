@@ -1,25 +1,22 @@
 #ifndef LIBBGTF_H
 #define LIBBGTF_H
 
-#include "hashtable.h"
-#include "utils.h"
-#include "rtree.h"
+
 #include <stdlib.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <string.h>
 #include <zlib.h>
 
+#include "hashtable.h"
+#include "utils.h"
+#include "rtree.h"
+#include "version.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-
-/*!
- * The library version number.
- */
-#define LIBBIGWIG_VERSION 0x000001;
-#define BGTF_MAGIC 0x8518B4
 
 /**
  * @brief The header section of a binary GTF file.
@@ -36,7 +33,15 @@ typedef struct {
     uint32_t buf_size;        /* The compression buffer size (if the data is compressed) */
 } BGTFHdr_t;
 
+/**
+ * @brief Initializing a BGTF header struct
+*/
 BGTFHdr_t *BGTFHdrInit();
+
+/**
+ * @brief Destroy a BGTF header struct
+ * @param hdr The BGTF header to destroy
+*/
 void BGTFHdrDestroy(BGTFHdr_t *hdr);
 
 
@@ -48,16 +53,16 @@ void BGTFHdrDestroy(BGTFHdr_t *hdr);
  */
 enum BGTF_ATTR_MAGIC
 {
-    GENE_ID = 0xFB38C285,
-    GENE_VERSION = 0xEEC739AE,
-    GENE_NAME = 0x10147D75,
-    TRANSCRIPT_ID = 0xF196D644,
+    GENE_ID            = 0xFB38C285,
+    GENE_VERSION       = 0xEEC739AE,
+    GENE_NAME          = 0x10147D75,
+    TRANSCRIPT_ID      = 0xF196D644,
     TRANSCRIPT_VERSION = 0xF52AA54F,
-    TRANSCRIPT_NAME = 0xE73C9D74,
-    EXON_NUMBER = 0x90DDCE56,
-    EXON_ID = 0xB1EA8EA8,
-    FAMILY_ID = 0xAEF4ABD6,
-    CLASS_ID = 0x2945B542,
+    TRANSCRIPT_NAME    = 0xE73C9D74,
+    EXON_NUMBER        = 0x90DDCE56,
+    EXON_ID            = 0xB1EA8EA8,
+    FAMILY_ID          = 0xAEF4ABD6,
+    CLASS_ID           = 0x2945B542,
 };
 
 /**
@@ -77,7 +82,7 @@ typedef struct RecordAttrKV {
 } RecordAttrKV_t; 
 
 RecordAttrKV_t *parseRecordAttrKV(char *src);
-// TODO: Should move to internal API
+
 uint8_t setRecordAttrKV_helper(RecordAttrKV_t *attr, uint32_t magic, char *v);
 uint8_t setRecordAttrKV(RecordAttrKV_t *attr, char *k, char *v);
 char *getRecordAttrKV_helper(RecordAttrKV_t *attr, uint32_t magic);
@@ -108,7 +113,7 @@ typedef struct BGTFRecordIdx
 {
     BGTFRecord_t *head;
     BGTFRecord_t *tail;
-    RTree *rt;
+    RTree_t *rt;
 } BGTFRecordIdx;
 
 typedef struct BGTFIdx

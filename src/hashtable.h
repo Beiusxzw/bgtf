@@ -4,7 +4,6 @@
 #include <stddef.h>
 #include <assert.h>
 #include <stdlib.h>
-#include "utils.h"
 #include "list.h"
 
 
@@ -123,5 +122,15 @@ int HashTablePutReplaceEx(HashTable *hashTable, const void *key, void *value, in
         } \
     } \
 } while (0);\
+
+static inline void counterAdd(HashTable *counter, char *key)
+{
+    if (!(HashTableContainsKey(counter, key)))
+    {
+        HashTablePut(counter, key, 1);
+    }
+    int c = HashTableGet(counter, key);
+    HashTablePut(counter, key, c + 1);
+}
 
 #endif

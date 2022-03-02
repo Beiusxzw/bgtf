@@ -84,8 +84,6 @@ $(OBJ_DIR)/molcount.o: $(SRC_DIR)/molcount.c
 		$(CC) -c $(CFLAGS) $(INCLUDES) $(INCLUDE_FLAGS) $< -o $@
 $(OBJ_DIR)/sparse.o: $(SRC_DIR)/sparse.c
 		$(CC) -c $(CFLAGS) $(INCLUDES) $(INCLUDE_FLAGS) $< -o $@
-$(OBJ_DIR)/bgtf-bam.o: $(SRC_DIR)/bgtf-bam.c
-		$(CC) -c $(CFLAGS) $(INCLUDES) $(INCLUDE_FLAGS) $< -o $@
 
 $(LIB_DIR)/libdeflate.a: $(LIBDEFLATE_DIR)/*.h $(LIBDEFLATE_DIR)/lib/*.h $(LIBDEFLATE_DIR)/lib/*/*.h $(LIBDEFLATE_DIR)/lib/*.c $(LIBDEFLATE_DIR)/lib/*/*.c
 	+. ./source_me.sh && cd $(LIBDEFLATE_DIR) && V=1 $(MAKE) $(FILTER) && cp libdeflate.a $(CWD)/$(LIB_DIR)

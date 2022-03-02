@@ -1,4 +1,5 @@
 #include "hashtable.h"
+#include "utils.h"
 
 static int pointercmp(const void *pointer1, const void *pointer2) {
 	return (pointer1 != pointer2);
@@ -17,7 +18,7 @@ static int isProbablePrime(size_t oddNumber) {
 		else if (oddNumber%i == 0)
 			return 0;
 
-	return 1; /* maybe */
+	return 1; /*maybe */
 }
 
 RedBlackTree *RedBlackTreeInit()
@@ -340,7 +341,7 @@ static size_t calculateIdealNumOfBuckets(HashTable *hashTable) {
 	if (idealNumOfBuckets < 5)
 		idealNumOfBuckets = 5;
 	else
-		idealNumOfBuckets |= 0x01; /* make it an odd number */
+		idealNumOfBuckets |= 0x01; /*make it an odd number */
 	while (!isProbablePrime(idealNumOfBuckets))
 		idealNumOfBuckets += 2;
 
@@ -364,7 +365,7 @@ HashTable *HashTableCreate(size_t numOfBuckets) {
 	hashTable->counter3=0;
 
 	hashTable->bucketArray = (KeyValuePair **)
-						malloc(numOfBuckets * sizeof(KeyValuePair *));
+						malloc(numOfBuckets *sizeof(KeyValuePair *));
 	if (hashTable->bucketArray == NULL) {
 		free(hashTable);
 		return NULL;
@@ -605,13 +606,13 @@ void HashTableRehash(HashTable *hashTable, size_t numOfBuckets) {
 		numOfBuckets = calculateIdealNumOfBuckets(hashTable);
 
 	if (numOfBuckets == hashTable->numOfBuckets)
-		return; /* already the right size! */
+		return; /*already the right size! */
 
 	newBucketArray = (KeyValuePair **)
-								malloc(numOfBuckets * sizeof(KeyValuePair *));
+								malloc(numOfBuckets *sizeof(KeyValuePair *));
 	if (newBucketArray == NULL) {
-		/* Couldn't allocate memory for the new array.  This isn't a fatal
-		 * error; we just can't perform the rehash. */
+		/*Couldn't allocate memory for the new array.  This isn't a fatal
+		 *error; we just can't perform the rehash. */
 		return;
 	}
 
@@ -654,22 +655,18 @@ void HashTableSetDeallocationFunctions(HashTable *hashTable,
 }
 
 /**
- * @brief __ac_X31_hash_string
- * 
- * @param key 
- * @return uint32_t 
+ *@brief HashTableStringHashFunction wraps __ac_X31_hash_string
+ *
+ *@param key 
+ *@return uint32_t 32 bits integer
  */
 uint32_t HashTableStringHashFunction(const void *key) {
-    char *s = (char *)key;
-	uint32_t h = (uint32_t)*s;
-	if (h) for (++s ; *s; ++s) h = (h << 5) - h + (uint32_t)*s;
-	return h;
-
+    return __ac_X31_hash_string(key);
 }
 
-void free_values_destroy(HashTable * tab)
+void free_values_destroy(HashTable *tab)
 {
-	KeyValuePair * cursor;
+	KeyValuePair *cursor;
 	int bucket;
 	
 	for(bucket=0; bucket< tab -> numOfBuckets; bucket++)
@@ -678,7 +675,7 @@ void free_values_destroy(HashTable * tab)
 		while (1)
 		{
 			if(!cursor) break;
-			char * read_txt = (char *) cursor ->value;
+			char *read_txt = (char *) cursor ->value;
 			free(read_txt);
 			cursor = cursor->next;
 		}
@@ -686,13 +683,13 @@ void free_values_destroy(HashTable * tab)
 	HashTableDestroy(tab);
 }
 
-void HashTableIteration(HashTable * tab, void process_item(void * key, void * hashed_obj, HashTable * tab) )
+void HashTableIteration(HashTable *tab, void process_item(void *key, void *hashed_obj, HashTable *tab) )
 {
 	int i;
 	for (i=0; i< tab ->numOfBuckets; i++) {
 		KeyValuePair *pair = tab ->bucketArray[i];
 		while (pair != NULL) {
-			process_item(( void * )pair -> key, pair -> value, tab);
+			process_item(( void *)pair -> key, pair -> value, tab);
 			KeyValuePair *nextPair = pair->next;
 			pair = nextPair;
 		}
