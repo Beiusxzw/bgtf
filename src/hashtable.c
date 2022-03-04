@@ -497,6 +497,7 @@ int HashTablePutReplace(HashTable *hashTable, const void *key, void *value, int 
 
 
 void *HashTableGet(const HashTable *hashTable, const void *key) {
+	if (!key) return NULL;
 	size_t hashValue = hashTable->hashFunction(key) % hashTable->numOfBuckets;
 	KeyValuePair *pair = hashTable->bucketArray[hashValue];
 	while (pair != NULL && hashTable->keycmp(key, pair->key) != 0)

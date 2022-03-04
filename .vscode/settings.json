@@ -40,6 +40,13 @@
         "array": "c",
         "utility": "c",
         "param.h": "c",
-        "hashtable.h": "c"
+        "hashtable.h": "c",
+        "__hash_table": "c",
+        "__split_buffer": "c",
+        "initializer_list": "c",
+        "queue": "c",
+        "string": "c",
+        "string_view": "c",
+        "unordered_map": "c"
     },
 }

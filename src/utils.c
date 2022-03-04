@@ -85,5 +85,5 @@ uint8_t bgtf_str_startswith(char *s, char *prefix)
 uint8_t bgtf_str_endswith(char *s, char *suffix)
 {
     int suffix_l = strlen(suffix);
-    return (strncmp(s + strlen(s) - suffix_l, suffix, suffix_l) == 0)
+    return (strncmp(s + strlen(s) - suffix_l, suffix, suffix_l) == 0);
 }

@@ -177,7 +177,7 @@ uint8_t BGTFBuildIndex(BGTF *file, char *attr_name)
         }
         if (attr_name) {
             k = getRecordAttrKV(curr->attrs, attr_name);
-            if (!(HashTableContainsKey(file->attr_table, k))) {
+            if (k && !(HashTableContainsKey(file->attr_table, k))) {
                 HashTablePut(file->attr_table, k, attr_idx);
                 attr_idx++;
             }
@@ -268,7 +268,10 @@ uint8_t BGTFGetRecord(BGTF *fp, struct GenomicLocation *loc, void (*func)(BGTFRe
     char *chrom = loc->chrom;
     uint64_t start = loc->start;
     uint64_t end = loc->end;
-    if (chrom == NULL) return 1;
+    if ((int)chrom == 0 || strlen(chrom) == 0) return 1; 
+    // It is wierd that in some case the 
+    // the chromosome of the bam record is NULL
+    if (!(HashTableContainsKey(fp->index->chrom_idx, chrom))) return 1;
     BGTFRecordIdx *idx = HashTableGet(fp->index->chrom_idx, chrom);
     if (idx == NULL) return 1;
     uint64_t interval[] = {start, end};

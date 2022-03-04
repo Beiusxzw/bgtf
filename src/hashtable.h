@@ -124,7 +124,8 @@ int HashTablePutReplaceEx(HashTable *hashTable, const void *key, void *value, in
 } while (0);\
 
 static inline void counterAdd(HashTable *counter, char *key)
-{
+{   
+    if (!key) return;
     if (!(HashTableContainsKey(counter, key)))
     {
         HashTablePut(counter, key, 1);

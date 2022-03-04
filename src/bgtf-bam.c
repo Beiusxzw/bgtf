@@ -41,14 +41,20 @@ PairedAlignment *parsePairedAlignment(
     char *bam_barcode)
 {
     PairedAlignment *paired_aln;
-    BamAlignment *aln = parseOneAlignment(bamfile);
-    if (!aln) {
-        if (HashTableSize(peIter->read_table) == 0) {
+    uint8_t z = 1;
+    BamAlignment *aln;
+    while (z) {
+        aln = parseOneAlignment(bamfile);
+        if (!aln) {
             return NULL;
+        }
+        if ((bamfile->aln->core.flag & BAM_FPROPER_PAIR) == 0) {
+            BamAlignmentDestroy(aln);
         } else {
-            return NULL; //TODO: return the remaining unpaired reads
+            z = 0;
         }
     }
+
     char *_read_name = bam_get_qname(bamfile->aln);
     char *read_name = malloc(strlen(_read_name)+1);
     memset(read_name, 0, strlen(_read_name)+1);
@@ -65,16 +71,7 @@ PairedAlignment *parsePairedAlignment(
         memset(barcode, 0, strlen(_barcode)+1);
         memcpy(barcode, _barcode, strlen(_barcode));
     }
-    
 
-    if ((bamfile->aln->core.flag & BAM_FPROPER_PAIR) == 0) {
-        paired_aln = PairedAlignmentInit(0);
-        paired_aln->mate1 = aln;
-        paired_aln->qname = read_name;
-        paired_aln->barcode = barcode;
-        if (bam_barcode) paired_aln->_free_barcode = 0;
-        return paired_aln;
-    }
 
     if (!(HashTableContainsKey(peIter->read_table, read_name))) {
         
@@ -110,8 +107,17 @@ PairedAlignment *parsePairedAlignment(
 
 BamAlignment *parseOneAlignment(BamFile_t *bamfile)
 {
-    if (!(sam_read1(bamfile->fp, bamfile->bam_hdr, bamfile->aln) > 0)) {
-        return NULL;
+    uint8_t z = 1;
+    while (z) {
+        if (!(sam_read1(bamfile->fp, bamfile->bam_hdr, bamfile->aln) > 0)) {
+            return NULL;
+        }
+        if (bamfile->aln->core.tid < 0) {
+            /* Check whether the BAM contig is valid. This should not happen.*/
+            // warnf("The contig id from this BamRecord is invalid. Please check your BAM file!");
+        } else {
+            z = 0;
+        }
     }
     BamAlignment *baln = BamAlignmentInit();
     baln->flag = bamfile->aln->core.flag;
@@ -122,6 +128,8 @@ BamAlignment *parseOneAlignment(BamFile_t *bamfile)
     uint32_t n_cigar = bamfile->aln->core.n_cigar;
     uint64_t start = bamfile->aln->core.pos + 1;
     uint64_t end = start;
+
+    
     for (uint32_t i = 0; i < n_cigar; ++i) {
         const int op = bam_cigar_op(cigar[i]);
         const int ol = bam_cigar_oplen(cigar[i]);

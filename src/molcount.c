@@ -61,6 +61,7 @@ uint8_t annotateBam(BGTF *fp, BamAlignment *baln, char *attr_name)
     HashTable *counter = HashTableCreate(0x4);
     HashTableSetKeyComparisonFunction(counter, strncmp);
     HashTableSetHashFunction(counter, HashTableStringHashFunction);
+    
     uint8_t success_flag = 0;
     uint8_t spliced_flag = 0;
     char *feature_name;
@@ -634,6 +635,7 @@ void molecularCountParallelizer(void *arg) {
 
     if (pa->rmsk_mtx) pthread_mutex_unlock(&pa->rmsk_mtx->mu);
     pthread_mutex_unlock(&pa->mtx->mu);
+    
     ArrayListDestroy(par_result);
     ParallelizerArgClean(arg);
 }
@@ -649,7 +651,9 @@ uint8_t molecularCountInternal(
                     char *bam_tag,
                     uint8_t bam_paired,
                     char *bam_barcode,
-                    int n_threads,
+                    int n_threads, 
+                    tpool_t *p,
+                    tpool_process_t *q,
                     uint32_t n_alignment_per_thread,
                     BamFile_t *bamfile
                 );
@@ -693,7 +697,7 @@ uint8_t molecularCount(char *bgtf_path,
             tfp = BGTFInit();
             BGTFLoad(tfp, rmsk_path, rmsk_attr_name);
         } else if (bgtf_str_endswith(rmsk_path, "gtf")) {
-            tfp = GTFRead(rmsk_path, attr_name);
+            tfp = GTFRead(rmsk_path, rmsk_attr_name);
         } else {
             fatalf("The input reference file %s has wrong extension. \n "
             "Please check whether the file ends with .gtf or .bgtf", rmsk_path);
@@ -815,6 +819,14 @@ uint8_t molecularCount(char *bgtf_path,
     free(barcode_output_path);
     ArrayListDestroy(sort_arr);
 
+    tpool_t *p = NULL;
+    tpool_process_t *q = NULL;
+    if (n_threads > 1) {
+        pthread_setconcurrency(2);
+        p = tpool_init(n_threads);
+        q = tpool_process_init(p, 16, true);
+        ExpressionMatrixSetMt(matrix);
+    }
 
     log("Start counting molecules");
     if (bam_path) {
@@ -829,7 +841,7 @@ uint8_t molecularCount(char *bgtf_path,
             bam_tag,
             bam_paired,
             NULL,
-            n_threads,
+            n_threads, p, q,
             n_alignment_per_thread,
             bamfile);
     } else {
@@ -848,7 +860,7 @@ uint8_t molecularCount(char *bgtf_path,
                     bam_tag,
                     bam_paired,
                     bam_path, // cell barcode provided here
-                    n_threads,
+                    n_threads, p, q,
                     n_alignment_per_thread,
                     bamfile
                 );
@@ -856,6 +868,11 @@ uint8_t molecularCount(char *bgtf_path,
         });
     }
 
+    if (n_threads > 1) {
+        ExpressionMatrixUnsetMt(matrix);
+        tpool_process_destroy(q);
+        tpool_destroy(p);
+    }
 
     log("Counting finished");
     char *mtx_output_path = calloc(strlen(output_path) + 12, 1);
@@ -919,12 +936,12 @@ void count_usage()
 "     -c          [PATH]   Cell barcode file \n"
 "     -i          [STRING] BAM tag of barcode. Default is CB \n"
 "     -g          [STRING] feature name to be counted \n"
-"     -r          [PATH]   Gene BGTF file \n"
+"     -r          [PATH]   Gene reference file with extension .gtf or .bgtf \n"
 "   Optional arguments:\n"
 "     -b          [PATH]   Input BAM file \n"
 "     -B          [PATH]   output gene annotation to a BAM file if set \n"
 "     -d          [PATH]   Input BAM directory \n"
-"     -m          [PATH]   RMSK BGTF file. Mask TE if set \n"
+"     -m          [PATH]   RMSK GTF file. Count TE if set.  with extension .gtf or .bgtf \n"
 "     -t          [INT]    n parallel thread if setted \n"
 "     -T          [INT]    n alignment to process in one thread. Default is 1000000 \n"
 "\n");
@@ -1092,6 +1109,8 @@ uint8_t molecularCountInternal(
     uint8_t bam_paired,
     char *bam_barcode,
     int n_threads,
+    tpool_t *p,
+    tpool_process_t *q,
     uint32_t n_alignment_per_thread,
     BamFile_t *bamfile)
 {
@@ -1114,7 +1133,6 @@ uint8_t molecularCountInternal(
         {
             while (baln = parseOneAlignment(bamfile))
             {
-                // printf("read name %s\n", bam_get_qname(bamfile->aln));
                 uint8_t ret;
                 if (tfp)
                 {
@@ -1221,13 +1239,6 @@ uint8_t molecularCountInternal(
     }
     else
     {
-        tpool_t *p;
-        tpool_process_t *q;
-        pthread_setconcurrency(2);
-        p = tpool_init(n_threads);
-        q = tpool_process_init(p, 16, true);
-        ExpressionMatrixSetMt(matrix);
-    
 
         par_data = ArrayListCreate(1000000);
         if (bam_paired)
@@ -1347,9 +1358,6 @@ uint8_t molecularCountInternal(
             blk = tpool_dispatch(p, q, molecularCountParallelizer, (void *)arg, NULL, NULL, true);
             tpool_process_flush(q);
         }
-        ExpressionMatrixUnsetMt(matrix);
-        tpool_process_destroy(q);
-        tpool_destroy(p);
     }
     return 0;
 }

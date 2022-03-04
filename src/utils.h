@@ -196,6 +196,16 @@ static inline void crash_handler(int sig_num, siginfo_t *info, ucontext_t *ucont
         puts("This program had a \033[1;31mbus error\033[0m");
         break;
 #endif /* SIGBUS */
+#ifdef SIGINT
+    case SIGINT:
+        puts("This program had a \033[1;31m Interrupt\033[0m");
+        break;
+#endif /* SIGINT */
+#ifdef SIGTSTP
+    case SIGTSTP:
+        puts("This program had a \033[1;31m Stop Signal\033[0m");
+        break;
+#endif /* SIGTSTP */
     }
 
     size = backtrace(array, 5);
